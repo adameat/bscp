@@ -18,6 +18,7 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+from __future__ import print_function
 import hashlib
 import struct
 import subprocess
@@ -33,11 +34,13 @@ import sys
 (size, blocksize, filename_len, hashname_len) = struct.unpack('<QQQQ', sys.stdin.read(8+8+8+8))
 filename = sys.stdin.read(filename_len)
 hashname = sys.stdin.read(hashname_len)
+hashfilename = filename + '.' + hashname
 
 sanity_hash = hashlib.new(hashname, filename).digest()
 sys.stdout.write(sanity_hash)
 sys.stdout.flush()
-if sys.stdin.read(2) != 'go':
+cmd = sys.stdin.read(2)
+if cmd != 'go' and cmd != 'ho':
     sys.exit()
 
 if not os.path.exists(filename):
@@ -46,47 +49,55 @@ if not os.path.exists(filename):
         f.truncate(size)
     os.chmod(filename, 0600)
 
+hashsize = hashlib.new(hashname).digestsize
+
+if not os.path.exists(hashfilename):
+    with open(hashfilename, 'wb') as h:
+        h.truncate(0)
+    os.chmod(hashfilename, 0600)
+
+h = open(hashfilename, 'rb+')
+h.seek(0, 2)
+h.seek(0)
+
 with open(filename, 'rb+') as f:
     f.seek(0, 2)
     sys.stdout.write(struct.pack('<Q', f.tell()))
+    sys.stdout.flush()
     readremain = size
     rblocksize = blocksize
     f.seek(0)
+    position = 0
     while True:
         if readremain <= blocksize:
             rblocksize = readremain
-        block = f.read(rblocksize)
-        if len(block) == 0:
-            break
-        digest = hashlib.new(hashname, block).digest()
+        digest = h.read(hashsize)
+        if len(digest) != hashsize:
+            f.seek(position)
+            block = f.read(rblocksize)
+            if len(block) < rblocksize:
+                break
+            digest = hashlib.new(hashname, block).digest()
+            h.seek(position / blocksize * hashsize)
+            h.write(digest)
+            h.flush()
+        position += rblocksize
         sys.stdout.write(digest)
+        sys.stdout.flush()
         readremain -= rblocksize
         if readremain == 0:
-	    break
-    sys.stdout.flush()
+            break
     while True:
         position_s = sys.stdin.read(8)
         if len(position_s) == 0:
             break
         (position,) = struct.unpack('<Q', position_s)
         block = sys.stdin.read(blocksize)
+        digest = hashlib.new(hashname, block).digest()
         f.seek(position)
         f.write(block)
-    readremain = size
-    rblocksize = blocksize
-    hash_total = hashlib.new(hashname)
-    f.seek(0)
-    while True:
-        if readremain <= blocksize:
-            rblocksize = readremain
-        block = f.read(rblocksize)
-        if len(block) == 0:
-            break
-        hash_total.update(block)
-        readremain -= rblocksize
-        if readremain == 0:
-	    break
-sys.stdout.write(hash_total.digest())
+        h.seek(position / blocksize * hashsize)
+        h.write(digest)
 '''
 
 class IOCounter:
@@ -114,10 +125,17 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
         size = f.tell()
         f.seek(0)
 
+        if blocksize == 0:
+            blocksize = size / 10240
+            if blocksize < 64 * 1024:
+                blocksize = 64 * 1024
+
         # Calculate number of blocks, including the last block which may be smaller
         blockcount = int((size + blocksize - 1) / blocksize)
 
-        remote_command = 'python -c "%s"' % (remote_script,)
+        print('blocks %i x %i' % (blockcount, blocksize))
+
+        remote_command = 'python2.7 -c "%s"' % (remote_script,)
         command = ('ssh', '--', remote_host, remote_command)
         p = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         io = IOCounter(p.stdout, p.stdin)
@@ -129,31 +147,49 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
         sanity_digest = hashlib.new(hashname, remote_filename).digest()
         remote_digest = io.read(len(sanity_digest))
         if remote_digest != sanity_digest:
+            print(remote_digest + io.read(5))
+            print(sanity_digest)
             raise RuntimeError('Remote script failed to execute properly')
         io.write('go')
 
         (remote_size,) = struct.unpack('<Q', io.read(8))
         if remote_size < size:
             raise RuntimeError('Remote size less than local (local: %i, remote: %i)' % (size, remote_size))
-        remote_digest_list = [io.read(hash_total.digestsize) for i in xrange(blockcount)]
 
-        for remote_digest in remote_digest_list:
+        print('hashing...')
+
+        changed_positions = []
+        for i in xrange(blockcount):
+            remote_digest = io.read(hash_total.digestsize)
             position = f.tell()
             block = f.read(blocksize)
             hash_total.update(block)
             digest = hashlib.new(hashname, block).digest()
             if digest != remote_digest:
+                changed_positions.append(position)
+            print('%i / %i = %i%% total (%i%% changed)' % (position + len(block), size, (position + len(block)) * 100 / size, len(changed_positions) * 100 / blockcount), end = '\r')
+            sys.stdout.flush()
+
+        print()
+
+        if len(changed_positions) > 0:
+            print('uploading...')
+
+            for position in changed_positions:
+                f.seek(position)
+                block = f.read(blocksize)
                 try:
                     io.write(struct.pack('<Q', position))
                     io.write(block)
-                except IOError:
+                    print('%i / %i = %i%% total' % (position + len(block), size, (position + len(block)) * 100 / size), end = '\r')
+                    sys.stdout.flush()
+                except IOError as e:
+                    print(e)
                     break
+            print()
+
         p.stdin.close()
 
-        remote_digest_total = io.read()
-        p.wait()
-        if remote_digest_total != hash_total.digest():
-            raise RuntimeError('Checksum mismatch after transfer')
     return (io.in_total, io.out_total, size)
 
 if __name__ == '__main__':
@@ -163,7 +199,7 @@ if __name__ == '__main__':
         if len(sys.argv) >= 4:
             blocksize = int(sys.argv[3])
         else:
-            blocksize = 64 * 1024
+            blocksize = 0
         if len(sys.argv) >= 5:
             hashname = sys.argv[4]
         else:
