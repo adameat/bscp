@@ -23,6 +23,8 @@ import hashlib
 import struct
 import subprocess
 import sys
+import os
+import lz4.frame
 
 remote_script = r'''
 import hashlib
@@ -30,6 +32,7 @@ import os
 import os.path
 import struct
 import sys
+import lz4.frame
 
 (size, blocksize, filename_len, hashname_len) = struct.unpack('<QQQQ', sys.stdin.read(8+8+8+8))
 filename = sys.stdin.read(filename_len)
@@ -88,11 +91,11 @@ with open(filename, 'rb+') as f:
         if readremain == 0:
             break
     while True:
-        position_s = sys.stdin.read(8)
+        position_s = sys.stdin.read(8 + 8)
         if len(position_s) == 0:
             break
-        (position,) = struct.unpack('<Q', position_s)
-        block = sys.stdin.read(blocksize)
+        (position,size,) = struct.unpack('<QQ', position_s)
+        block = lz4.frame.decompress(sys.stdin.read(size))
         digest = hashlib.new(hashname, block).digest()
         f.seek(position)
         f.write(block)
@@ -147,7 +150,7 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
         sanity_digest = hashlib.new(hashname, remote_filename).digest()
         remote_digest = io.read(len(sanity_digest))
         if remote_digest != sanity_digest:
-            print(remote_digest + io.read(5))
+            print(remote_digest + io.read(100))
             print(sanity_digest)
             raise RuntimeError('Remote script failed to execute properly')
         io.write('go')
@@ -179,8 +182,9 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
                 f.seek(position)
                 block = f.read(blocksize)
                 try:
-                    io.write(struct.pack('<Q', position))
-                    io.write(block)
+                    compressed_block = lz4.frame.compress(block)
+                    io.write(struct.pack('<QQ', position, len(compressed_block)))
+                    io.write(compressed_block)
                     print('%i / %i = %i%% total' % (position + len(block), size, (position + len(block)) * 100 / size), end = '\r')
                     sys.stdout.flush()
                 except IOError as e:
