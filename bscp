@@ -84,23 +84,22 @@ with open(filename, 'rb+') as f:
             h.seek(position / blocksize * hashsize)
             h.write(digest)
             h.flush()
-        position += rblocksize
         sys.stdout.write(digest)
         sys.stdout.flush()
+        confirm = sys.stdin.read(6)
+        if confirm == 'update':
+            (size,) = struct.unpack('<Q', sys.stdin.read(8))
+            block = lz4.frame.decompress(sys.stdin.read(size))
+            digest = hashlib.new(hashname, block).digest()
+            f.seek(position)
+            f.write(block)
+            h.seek(position / blocksize * hashsize)
+            h.write(digest)
+
+        position += rblocksize
         readremain -= rblocksize
         if readremain == 0:
             break
-    while True:
-        position_s = sys.stdin.read(8 + 8)
-        if len(position_s) == 0:
-            break
-        (position,size,) = struct.unpack('<QQ', position_s)
-        block = lz4.frame.decompress(sys.stdin.read(size))
-        digest = hashlib.new(hashname, block).digest()
-        f.seek(position)
-        f.write(block)
-        h.seek(position / blocksize * hashsize)
-        h.write(digest)
 '''
 
 class IOCounter:
@@ -159,38 +158,30 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
         if remote_size < size:
             raise RuntimeError('Remote size less than local (local: %i, remote: %i)' % (size, remote_size))
 
-        print('hashing...')
+        changed_blocks = 0
 
-        changed_positions = []
         for i in xrange(blockcount):
-            remote_digest = io.read(hash_total.digestsize)
             position = f.tell()
+            print('%i / %i = %i%% total (%i%% changed) READ' % (position, size, (position) * 100 / size, changed_blocks * 100 / blockcount), end = '\r')
+            sys.stdout.flush()
             block = f.read(blocksize)
             hash_total.update(block)
             digest = hashlib.new(hashname, block).digest()
-            if digest != remote_digest:
-                changed_positions.append(position)
-            print('%i / %i = %i%% total (%i%% changed)' % (position + len(block), size, (position + len(block)) * 100 / size, len(changed_positions) * 100 / blockcount), end = '\r')
+            print('%i / %i = %i%% total (%i%% changed) WAIT' % (position + len(block), size, (position + len(block)) * 100 / size, changed_blocks * 100 / blockcount), end = '\r')
             sys.stdout.flush()
+            remote_digest = io.read(hash_total.digestsize)
+            if digest != remote_digest:
+                io.write('update')
+                compressed_block = lz4.frame.compress(block)
+                print('%i / %i = %i%% total (%i%% changed) SEND' % (position + len(block), size, (position + len(block)) * 100 / size, changed_blocks * 100 / blockcount), end = '\r')
+                sys.stdout.flush()
+                io.write(struct.pack('<Q', len(compressed_block)))
+                io.write(compressed_block)
+                changed_blocks += 1
+            else:
+                io.write('ignore')
 
         print()
-
-        if len(changed_positions) > 0:
-            print('uploading...')
-
-            for position in changed_positions:
-                f.seek(position)
-                block = f.read(blocksize)
-                try:
-                    compressed_block = lz4.frame.compress(block)
-                    io.write(struct.pack('<QQ', position, len(compressed_block)))
-                    io.write(compressed_block)
-                    print('%i / %i = %i%% total' % (position + len(block), size, (position + len(block)) * 100 / size), end = '\r')
-                    sys.stdout.flush()
-                except IOError as e:
-                    print(e)
-                    break
-            print()
 
         p.stdin.close()
 
