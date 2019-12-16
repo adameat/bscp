@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3.6
 
 # Copyright (C) 2012-2016
 #
@@ -23,8 +23,13 @@ import hashlib
 import struct
 import subprocess
 import sys
+import threading
+import queue
 import os
+import signal
 import lz4.frame
+import locale
+import time
 
 remote_script = r'''
 import hashlib
@@ -35,9 +40,10 @@ import sys
 import threading
 import lz4.frame
 
-(size, blocksize, filename_len, hashname_len) = struct.unpack('<QQQQ', sys.stdin.read(8+8+8+8))
-filename = sys.stdin.read(filename_len)
-hashname = sys.stdin.read(hashname_len)
+(size, blocksize, filename_len, hashname_len) = struct.unpack('<QQQQ', sys.stdin.buffer.read(8+8+8+8))
+
+filename = sys.stdin.buffer.read(filename_len).decode()
+hashname = sys.stdin.buffer.read(hashname_len).decode()
 hashfilename = filename + '.' + hashname
 
 def writeThread():
@@ -49,25 +55,25 @@ def writeThread():
     f.seek(0)
 
     while True:
-        confirm = sys.stdin.read(6)
+        confirm = sys.stdin.buffer.read(6).decode()
         if confirm == 'update':
-            (position, size) = struct.unpack('<QQ', sys.stdin.read(8+8))
-            block = lz4.frame.decompress(sys.stdin.read(size))
-            #block = sys.stdin.read(size)
+            (position, size) = struct.unpack('<QQ', sys.stdin.buffer.read(8+8))
+            block = lz4.frame.decompress(sys.stdin.buffer.read(size))
+            #block = sys.stdin.buffer.read(size)
             digest = hashlib.new(hashname, block).digest()
             f.seek(position)
             f.write(block)
-            h.seek(position / blocksize * hashsize)
+            h.seek(int(position / blocksize * hashsize))
             h.write(digest)
         else:
             break
 
     return
 
-sanity_hash = hashlib.new(hashname, filename).digest()
-sys.stdout.write(sanity_hash)
+sanity_hash = hashlib.new(hashname, filename.encode()).digest()
+sys.stdout.buffer.write(sanity_hash)
 sys.stdout.flush()
-cmd = sys.stdin.read(2)
+cmd = sys.stdin.buffer.read(2).decode()
 if cmd != 'go' and cmd != 'ho':
     sys.exit()
 
@@ -75,14 +81,14 @@ if not os.path.exists(filename):
     # Create sparse file
     with open(filename, 'wb') as f:
         f.truncate(size)
-    os.chmod(filename, 0600)
+    # os.chmod(filename, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
 
-hashsize = hashlib.new(hashname).digestsize
+hashsize = hashlib.new(hashname).digest_size
 
 if not os.path.exists(hashfilename):
     with open(hashfilename, 'wb') as h:
         h.truncate(0)
-    os.chmod(hashfilename, 0600)
+    # os.chmod(hashfilename, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
 
 h = open(hashfilename, 'rb+')
 h.seek(0, 2)
@@ -94,7 +100,7 @@ with open(filename, 'rb+') as f:
     thread.start()
 
     f.seek(0, 2)
-    sys.stdout.write(struct.pack('<Q', f.tell()))
+    sys.stdout.buffer.write(struct.pack('<Q', f.tell()))
     sys.stdout.flush()
     readremain = size
     rblocksize = blocksize
@@ -110,10 +116,10 @@ with open(filename, 'rb+') as f:
             if len(block) < rblocksize:
                 break
             digest = hashlib.new(hashname, block).digest()
-            h.seek(position / blocksize * hashsize)
+            h.seek(int(position / blocksize * hashsize))
             h.write(digest)
             h.flush()
-        sys.stdout.write(digest)
+        sys.stdout.buffer.write(digest)
         sys.stdout.flush()
         position += rblocksize
         readremain -= rblocksize
@@ -123,12 +129,33 @@ with open(filename, 'rb+') as f:
     thread.join()
 '''
 
+
+class Averager:
+    def __init__(self):
+        self.accum = 0
+        self.count = 0
+
+    def add(self, accum):
+        self.accum += accum
+        self.count += 1
+        if self.count > 10:
+            self.accum /= 2
+            self.count /= 2
+
+    def get(self):
+        if self.count == 0:
+            return 0
+        return int(self.accum / self.count)
+
+
 class IOCounter:
     def __init__(self, in_stream, out_stream):
         self.in_stream = in_stream
         self.out_stream = out_stream
         self.in_total = 0
         self.out_total = 0
+        self.start_time = time.perf_counter()
+
     def read(self, size=None):
         if size is None:
             s = self.in_stream.read()
@@ -136,10 +163,94 @@ class IOCounter:
             s = self.in_stream.read(size)
         self.in_total += len(s)
         return s
+
     def write(self, s):
         self.out_stream.write(s)
-        self.out_total += len(s)
         self.out_stream.flush()
+        self.out_total += len(s)
+
+    def get_speed(self):
+        return self.in_total / (time.perf_counter() - self.start_time)
+
+    def get_time(self):
+        return time.perf_counter() - self.start_time
+
+
+def send_loop(q, io):
+    while True:
+        try:
+            (position, block) = q.get()
+            if position == 0 and len(block) == 0:
+                q.task_done()
+                break
+            io.write('update'.encode())
+            io.write(struct.pack('<QQ', position, len(block)))
+            io.write(block)
+            q.task_done()
+        except queue.Empty:
+            return
+        except Exception as e:
+            print(e)
+            return
+    io.write('doneho'.encode())
+
+
+def compress_and_send_loop(in_q, out_q):
+    while True:
+        try:
+            (position, block) = in_q.get()
+            if position == 0 and len(block) == 0:
+                out_q.put((0, []))
+                in_q.task_done()
+                break
+            compressed_block = lz4.frame.compress(block)
+            out_q.put((position, compressed_block))
+            in_q.task_done()
+        except queue.Empty:
+            return
+        except Exception as e:
+            print(e)
+            return
+
+
+def signal_handler(sig, frame):
+    print()
+    print('Interrupted')
+    sys.exit(1)
+
+
+def get_speed(speed):
+    prefix = 'B/s'
+    if speed > 1000:
+        speed /= 1000
+        prefix = 'KB/s'
+    if speed > 1000:
+        speed /= 1000
+        prefix = 'MB/s'
+    if speed > 1000:
+        speed /= 1000
+        prefix = 'GB/s'
+    return '%.1f%s' % (speed, prefix)
+
+
+def get_progress_bar1(amount, total):
+    return '[' + '|' * amount + ' ' * (total - amount) + ']'
+
+
+def report_progress(io, position, size, changed_blocks, skipped_blocks, block_count, queue_size, status):
+    tt = io.get_time()
+    if skipped_blocks + changed_blocks == 0:
+        print('%s / %s = %.1f%%' % (
+            locale.format('%i', position, grouping=True), locale.format('%i', size, grouping=True),
+            float(position) * 100 / size), end='\r')
+    else:
+        queue_pb = get_progress_bar1(queue_size, 9)
+        print('%s / %s = %.1f%% (%s, %.1fs, %i%% changed, skipped %i, changed %i, %s) %s ' % (
+            locale.format('%i', position, grouping=True), locale.format('%i', size, grouping=True),
+            float(position) * 100 / size, get_speed(float(position) / tt), tt,
+            changed_blocks * 100 / (skipped_blocks + changed_blocks),
+            skipped_blocks, changed_blocks, queue_pb, status), end='\r')
+
 
 def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
     hash_total = hashlib.new(hashname)
@@ -149,7 +260,7 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
         f.seek(0)
 
         if blocksize == 0:
-            blocksize = size / 10240
+            blocksize = int(size / 10240)
             if blocksize < 64 * 1024:
                 blocksize = 64 * 1024
 
@@ -158,60 +269,84 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
 
         print('blocks %i x %i' % (blockcount, blocksize))
 
-        remote_command = 'python2.7 -c "%s"' % (remote_script,)
+        remote_command = 'python3.6 -c "%s"' % (remote_script,)
+        # remote_command = 'python3.6 /root/test.py'
+
         command = ('ssh', '--', remote_host, remote_command)
         p = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         io = IOCounter(p.stdout, p.stdin)
 
-        io.write(struct.pack('<QQQQ', size, blocksize, len(remote_filename), len(hashname)))
-        io.write(remote_filename)
-        io.write(hashname)
+        rf = remote_filename.encode()
+        rh = hashname.encode()
+        io.write(struct.pack('<QQQQ', size, blocksize, len(rf), len(rh)))
+        io.write(rf)
+        io.write(rh)
 
-        sanity_digest = hashlib.new(hashname, remote_filename).digest()
+        sanity_digest = hashlib.new(hashname, rf).digest()
         remote_digest = io.read(len(sanity_digest))
         if remote_digest != sanity_digest:
-            print(remote_digest + io.read(100))
+            print(remote_digest + io.read(400))
             print(sanity_digest)
             raise RuntimeError('Remote script failed to execute properly')
-        io.write('go')
+
+        io.write('go'.encode())
 
         (remote_size,) = struct.unpack('<Q', io.read(8))
         if remote_size < size:
             raise RuntimeError('Remote size less than local (local: %i, remote: %i)' % (size, remote_size))
 
+        send_queue = queue.Queue(9)
+        send_thread = threading.Thread(target=send_loop, args=(send_queue, io,))
+        send_thread.daemon = True
+        send_thread.start()
+        compress_queue = queue.Queue(9)
+        compress_thread = threading.Thread(target=compress_and_send_loop, args=(compress_queue, send_queue,))
+        compress_thread.daemon = True
+        compress_thread.start()
+
+        locale.setlocale(locale.LC_ALL, '')
+
         changed_blocks = 0
         skipped_blocks = 0
 
-        for i in xrange(blockcount):
+        for i in range(blockcount):
             position = f.tell()
-            print('%i / %i = %i%% total (%i%% changed, blocks skipped %i, blocks changed %i) READ' % (position, size, (position) * 100 / size, changed_blocks * 100 / blockcount, skipped_blocks, changed_blocks), end = '\r')
+            report_progress(io, position, size, changed_blocks, skipped_blocks, blockcount, send_queue.qsize(), 'READ')
+            # print('%s / %s = %i%% total (%i%% changed, skipped %i, changed %i, queued %i) READ' % (locale.format('%i', position, grouping=True), locale.format('%i', size, grouping=True), (position) * 100 / size, changed_blocks * 100 / blockcount, skipped_blocks, changed_blocks, task_queue.qsize()), end = '\r')
             sys.stdout.flush()
             block = f.read(blocksize)
             hash_total.update(block)
             digest = hashlib.new(hashname, block).digest()
-            print('%i / %i = %i%% total (%i%% changed, blocks skipped %i, blocks changed %i) WAIT' % (position + len(block), size, (position + len(block)) * 100 / size, changed_blocks * 100 / blockcount, skipped_blocks, changed_blocks), end = '\r')
+            report_progress(io, position + len(block), size, changed_blocks, skipped_blocks, blockcount,
+                            send_queue.qsize(), 'WAIT')
+            # print('%s / %s = %i%% total (%i%% changed, skipped %i, changed %i, queued %i) WAIT' % (locale.format('%i', position + len(block), grouping=True), locale.format('%i', size, grouping=True), (position + len(block)) * 100 / size, changed_blocks * 100 / blockcount, skipped_blocks, changed_blocks, task_queue.qsize()), end = '\r')
             sys.stdout.flush()
-            remote_digest = io.read(hash_total.digestsize)
+            remote_digest = io.read(hash_total.digest_size)
             if digest != remote_digest:
-                io.write('update')
-                compressed_block = lz4.frame.compress(block)
-                #compressed_block = block;
-                changed_blocks += 1
-                print('%i / %i = %i%% total (%i%% changed, blocks skipped %i, blocks changed %i) SEND' % (position + len(block), size, (position + len(block)) * 100 / size, changed_blocks * 100 / blockcount, skipped_blocks, changed_blocks), end = '\r')
+                report_progress(io, position + len(block), size, changed_blocks, skipped_blocks, blockcount,
+                                send_queue.qsize(), 'SEND')
+                # print('%s / %s = %i%% total (%i%% changed, skipped %i, changed %i, queued %i) SEND' % (locale.format('%i', position + len(block), grouping=True), locale.format('%i', size, grouping=True), (position + len(block)) * 100 / size, changed_blocks * 100 / blockcount, skipped_blocks, changed_blocks, task_queue.qsize()), end = '\r')
                 sys.stdout.flush()
-                io.write(struct.pack('<QQ', position, len(compressed_block)))
-                io.write(compressed_block)
+                compress_queue.put((position, block))
+                changed_blocks += 1
             else:
                 skipped_blocks += 1
 
-        io.write('doneho')
         print()
+
+        compress_queue.put((0, []))
+        compress_queue.join()
+        compress_thread.join()
+        send_queue.join()
+        send_thread.join()
 
         p.stdin.close()
 
     return (io.in_total, io.out_total, size)
 
+
 if __name__ == '__main__':
+    signal.signal(signal.SIGINT, signal_handler)
     try:
         local_filename = sys.argv[1]
         (remote_host, remote_filename) = sys.argv[2].split(':')
