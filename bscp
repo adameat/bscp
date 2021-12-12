@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.6
+#!/usr/bin/env python3
 
 # Copyright (C) 2012-2016
 #
@@ -241,12 +241,12 @@ def report_progress(io, position, size, changed_blocks, skipped_blocks, block_co
     tt = io.get_time()
     if skipped_blocks + changed_blocks == 0:
         print('%s / %s = %.1f%%' % (
-            locale.format('%i', position, grouping=True), locale.format('%i', size, grouping=True),
+            locale.format_string('%i', position, grouping=True), locale.format_string('%i', size, grouping=True),
             float(position) * 100 / size), end='\r')
     else:
         queue_pb = get_progress_bar1(queue_size, 9)
         print('%s / %s = %.1f%% (%s, %.1fs, %i%% changed, skipped %i, changed %i, %s) %s ' % (
-            locale.format('%i', position, grouping=True), locale.format('%i', size, grouping=True),
+            locale.format_string('%i', position, grouping=True), locale.format_string('%i', size, grouping=True),
             float(position) * 100 / size, get_speed(float(position) / tt), tt,
             changed_blocks * 100 / (skipped_blocks + changed_blocks),
             skipped_blocks, changed_blocks, queue_pb, status), end='\r')
